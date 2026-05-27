@@ -1,4 +1,5 @@
 use super::wayland::{self, ClipboardItem};
+use base64::Engine;
 use crate::channels::AsyncSenderExt;
 use crate::{arc_mut, lock, register_client, spawn};
 use indexmap::IndexMap;
@@ -290,14 +291,9 @@ impl crate::ironvar::Namespace for CurrentItem {
             }),
             CURRENT_KEY_DATA => match item.value.as_ref() {
                 ClipboardValue::Text(value) => Some(value.clone()),
-                ClipboardValue::Image(bytes) => Some(
-                    // TODO: Give this in a more efficient format
-                    bytes
-                        .as_ref()
-                        .iter()
-                        .map(|byte| format!("{byte:02x}"))
-                        .collect(),
-                ),
+                ClipboardValue::Image(bytes) => {
+                    Some(base64::engine::general_purpose::STANDARD.encode(bytes))
+                }
                 ClipboardValue::Other => None,
             },
             CURRENT_KEY_SIZE => Some(match item.value.as_ref() {
