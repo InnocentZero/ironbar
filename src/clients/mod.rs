@@ -111,7 +111,14 @@ impl Clients {
         let wayland = self.wayland();
 
         self.clipboard
-            .get_or_insert_with(|| Arc::new(clipboard::Client::new(wayland)))
+            .get_or_insert_with(|| {
+                let client = Arc::new(clipboard::Client::new(wayland));
+
+                #[cfg(any(feature = "ipc", feature = "cairo"))]
+                Ironbar::variable_manager().register_namespace("clipboard", client.clone());
+
+                client
+            })
             .clone()
     }
 

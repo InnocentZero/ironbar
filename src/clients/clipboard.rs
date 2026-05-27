@@ -7,6 +7,11 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tracing::{debug, trace};
 
+#[cfg(any(feature = "ipc", feature = "cairo"))]
+use crate::ironvar::NamespaceTrait;
+#[cfg(any(feature = "ipc", feature = "cairo"))]
+use crate::clients::wayland::ClipboardValue;
+
 #[derive(Debug)]
 pub enum ClipboardEvent {
     Add(ClipboardItem),
@@ -18,12 +23,13 @@ type EventSender = mpsc::Sender<ClipboardEvent>;
 
 /// Clipboard client singleton,
 /// to ensure bars don't duplicate requests to the compositor.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Client {
     wayland: Arc<wayland::Client>,
 
     senders: Arc<Mutex<Vec<(EventSender, usize)>>>,
     cache: Arc<Mutex<ClipboardCache>>,
+    current_id: Arc<Mutex<Option<usize>>>,
 }
 
 impl Client {
@@ -33,10 +39,12 @@ impl Client {
         let senders = arc_mut!(Vec::<(EventSender, usize)>::new());
 
         let cache = arc_mut!(ClipboardCache::new());
+        let current_id = arc_mut!(None);
 
         {
             let senders = senders.clone();
             let cache = cache.clone();
+            let current_id = current_id.clone();
             let wl = wl.clone();
 
             spawn(async move {
@@ -50,6 +58,7 @@ impl Client {
                         tx.send_spawn(ClipboardEvent::Add(item.clone()));
                     }
 
+                    lock!(current_id).replace(item.id);
                     lock!(cache).insert(item, senders.len());
                 }
 
@@ -63,6 +72,7 @@ impl Client {
 
                     existing_id.map_or_else(
                         || {
+                            lock!(current_id).replace(item.id);
                             {
                                 let mut cache = lock!(cache);
                                 let senders = lock!(senders);
@@ -82,6 +92,7 @@ impl Client {
                             }
                         },
                         |existing_id| {
+                            lock!(current_id).replace(existing_id);
                             let senders = lock!(senders);
                             let iter = senders.iter();
                             for (tx, _) in iter {
@@ -97,6 +108,7 @@ impl Client {
             wayland: wl,
             senders,
             cache,
+            current_id,
         }
     }
 
@@ -129,6 +141,7 @@ impl Client {
             self.wayland.copy_to_clipboard(item);
         }
 
+        lock!(self.current_id).replace(id);
         let senders = lock!(self.senders);
         let iter = senders.iter();
         for (tx, _) in iter {
@@ -138,12 +151,22 @@ impl Client {
 
     pub fn remove(&self, id: usize) {
         lock!(self.cache).remove(id);
+        let mut current_id = lock!(self.current_id);
+        if current_id.is_some_and(|current_id| current_id == id) {
+            current_id.take();
+        }
 
         let senders = lock!(self.senders);
         let iter = senders.iter();
         for (tx, _) in iter {
             tx.send_spawn(ClipboardEvent::Remove(id));
         }
+    }
+
+    #[cfg(any(feature = "ipc", feature = "cairo"))]
+    fn current_item(&self) -> Option<ClipboardItem> {
+        let current_id = *lock!(self.current_id);
+        current_id.and_then(|id| lock!(self.cache).get(id))
     }
 }
 
@@ -230,6 +253,106 @@ impl ClipboardCache {
 
     fn iter(&self) -> Iter<'_, usize, (ClipboardItem, usize)> {
         self.cache.iter()
+    }
+}
+
+#[cfg(any(feature = "ipc", feature = "cairo"))]
+const CURRENT_NAMESPACE: &str = "current";
+#[cfg(any(feature = "ipc", feature = "cairo"))]
+const CURRENT_KEY_ID: &str = "id";
+#[cfg(any(feature = "ipc", feature = "cairo"))]
+const CURRENT_KEY_MIME_TYPE: &str = "mime_type";
+#[cfg(any(feature = "ipc", feature = "cairo"))]
+const CURRENT_KEY_TYPE: &str = "type";
+#[cfg(any(feature = "ipc", feature = "cairo"))]
+const CURRENT_KEY_DATA: &str = "data";
+#[cfg(any(feature = "ipc", feature = "cairo"))]
+const CURRENT_KEY_SIZE: &str = "size";
+
+#[cfg(any(feature = "ipc", feature = "cairo"))]
+#[derive(Debug)]
+struct CurrentItem {
+    client: Arc<Client>,
+}
+
+#[cfg(any(feature = "ipc", feature = "cairo"))]
+impl crate::ironvar::Namespace for CurrentItem {
+    fn get(&self, key: &str) -> Option<String> {
+        let item = self.client.current_item()?;
+
+        match key {
+            CURRENT_KEY_ID => Some(item.id.to_string()),
+            CURRENT_KEY_MIME_TYPE => Some(item.mime_type.to_string()),
+            CURRENT_KEY_TYPE => Some(match item.value.as_ref() {
+                ClipboardValue::Text(_) => "text".to_string(),
+                ClipboardValue::Image(_) => "image".to_string(),
+                ClipboardValue::Other => "other".to_string(),
+            }),
+            CURRENT_KEY_DATA => match item.value.as_ref() {
+                ClipboardValue::Text(value) => Some(value.clone()),
+                ClipboardValue::Image(bytes) => Some(
+                    // TODO: Give this in a more efficient format
+                    bytes
+                        .as_ref()
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect(),
+                ),
+                ClipboardValue::Other => None,
+            },
+            CURRENT_KEY_SIZE => Some(match item.value.as_ref() {
+                ClipboardValue::Text(value) => value.len(),
+                ClipboardValue::Image(bytes) => bytes.len(),
+                ClipboardValue::Other => 0,
+            }
+            .to_string()),
+            _ => None,
+        }
+    }
+
+    fn list(&self) -> Vec<String> {
+        [
+            CURRENT_KEY_ID,
+            CURRENT_KEY_MIME_TYPE,
+            CURRENT_KEY_TYPE,
+            CURRENT_KEY_DATA,
+            CURRENT_KEY_SIZE,
+        ]
+        .into_iter()
+        .map(ToString::to_string)
+        .collect()
+    }
+
+    fn namespaces(&self) -> Vec<String> {
+        vec![]
+    }
+
+    fn get_namespace(&self, _key: &str) -> Option<NamespaceTrait> {
+        None
+    }
+}
+
+#[cfg(any(feature = "ipc", feature = "cairo"))]
+impl crate::ironvar::Namespace for Client {
+    fn get(&self, _key: &str) -> Option<String> {
+        None
+    }
+
+    fn list(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn namespaces(&self) -> Vec<String> {
+        vec![CURRENT_NAMESPACE.to_string()]
+    }
+
+    fn get_namespace(&self, key: &str) -> Option<NamespaceTrait> {
+        match key {
+            CURRENT_NAMESPACE => Some(Arc::new(CurrentItem {
+                client: Arc::new(self.clone()),
+            })),
+            _ => None,
+        }
     }
 }
 
